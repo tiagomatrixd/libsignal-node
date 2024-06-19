@@ -32,12 +32,29 @@ function decrypt(key, data, iv) {
 }
 
 
+const ALGORITHM = 'sha256';
+
 function calculateMAC(key, data) {
-    assertBuffer(key);
-    assertBuffer(data);
-    const hmac = nodeCrypto.createHmac('sha256', key);
-    hmac.update(data);
-    return Buffer.from(hmac.digest());
+  // Validação de entrada
+  if (!Buffer.isBuffer(key) || !Buffer.isBuffer(data)) {
+    throw new TypeError('As chaves e os dados devem ser do tipo Buffer.');
+  }
+
+  let attempts = 0;
+  while (attempts < 3) {
+    try {
+      const hmac = nodeCrypto.createHmac(ALGORITHM, key);
+      hmac.update(data);
+      
+      return Buffer.from(hmac.digest());
+    } catch (error) {
+      console.error(`Erro ao calcular o MAC na tentativa ${attempts + 1}:`, error);
+      attempts++;
+      if (attempts === 3) {
+        throw new Error('Falha ao calcular o MAC após 3 tentativas.');
+      }
+    }
+  }
 }
 
 
@@ -79,12 +96,15 @@ function deriveSecrets(input, salt, info, chunks) {
 }
 
 function verifyMAC(data, key, mac, length) {
-    const calculatedMac = calculateMAC(key, data).slice(0, length);
-    if (mac.length !== length || calculatedMac.length !== length) {
-        throw new Error("Bad MAC length");
+    if (mac.length !== length) {
+        throw new Error(`Comprimento esperado do MAC: ${length}, recebido: ${mac.length}`);
     }
-    if (!mac.equals(calculatedMac)) {
-        throw new Error("Bad MAC");
+    
+    const calculatedMac = calculateMAC(key, data).slice(0, length);
+    
+    
+    if (!nodeCrypto.timingSafeEqual(calculatedMac, mac)) {
+        throw new Error("Falha na verificação do MAC");
     }
 }
 
