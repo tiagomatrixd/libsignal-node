@@ -4,6 +4,11 @@
   "description": "Open Whisper Systems' libsignal for Node.js",
   "repository": "ForstaLabs/libsignal-node",
   "main": "index.js",
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "clean": "node-gyp clean"
+  },
   "keywords": [
     "signal",
     "whispersystems",
@@ -11,7 +16,7 @@
   ],
   "license": "GPL-3.0",
   "dependencies": {
-    "curve25519-js": "^0.0.4",
+    "node-addon-api": "^7.1.0",
     "protobufjs": "^6.11.4"
   },
   "files": [

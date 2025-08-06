@@ -1,7 +1,7 @@
 
 'use strict';
 
-const curveJs = require('curve25519-js');
+const curveJs = require('../src/curve25519_wrapper');
 const nodeCrypto = require('crypto');
 // from: https://github.com/digitalbazaar/x25519-key-agreement-key-2019/blob/master/lib/crypto.js
 
@@ -36,17 +36,34 @@ function scrubPubKeyFormat(pubKey) {
 exports.createKeyPair = function(privKey) {
     validatePrivKey(privKey);
     const keys = curveJs.generateKeyPair(privKey);
-    // prepend version byte
-    var origPub = new Uint8Array(keys.public);
+    
+    // O wrapper nativo retorna pubKey/privKey, não public/private
+    const pubKeyData = keys.pubKey || keys.public;
+    const privKeyData = keys.privKey || keys.private;
+    
+    if (!pubKeyData || !privKeyData) {
+        throw new Error("Invalid key generation result");
+    }
+    
+    // Se a pubKey já tem 33 bytes (com version byte), usar diretamente
+    if (pubKeyData.length === 33 && pubKeyData[0] === 5) {
+        return {
+            pubKey: Buffer.from(pubKeyData),
+            privKey: Buffer.from(privKeyData)
+        };
+    }
+    
+    // Caso contrário, prepend version byte
+    var origPub = new Uint8Array(pubKeyData);
     var pub = new Uint8Array(33);
     pub.set(origPub, 1);
     pub[0] = 5;
     
-        return {
-            pubKey: Buffer.from(pub),
-            privKey: Buffer.from(keys.private)
-        };
-    }
+    return {
+        pubKey: Buffer.from(pub),
+        privKey: Buffer.from(privKeyData)
+    };
+}
 
 exports.calculateAgreement = function(pubKey, privKey) {
     pubKey = scrubPubKeyFormat(pubKey);
@@ -54,7 +71,7 @@ exports.calculateAgreement = function(pubKey, privKey) {
     if (!pubKey || pubKey.byteLength != 32) {
         throw new Error("Invalid public key");
     }
-    return Buffer.from(curveJs.sharedKey(privKey, pubKey));
+    return Buffer.from(curveJs.sharedKey(pubKey, privKey));
 };
 
 exports.calculateSignature = function(privKey, message) {
