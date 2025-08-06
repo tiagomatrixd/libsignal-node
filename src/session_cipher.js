@@ -12,6 +12,32 @@ const queueJob = require('./queue_job');
 
 const VERSION = 3;
 
+// Internal optimizations - use new modules if available, fallback to original
+let CONSTANTS, ValidationUtils, cryptoEngine;
+try {
+    CONSTANTS = require('./constants/protocol_constants');
+    ValidationUtils = require('./utils/validation_utils');
+    ({ cryptoEngine } = require('./crypto/crypto_engine'));
+} catch (e) {
+    // Fallback to original behavior
+    CONSTANTS = {
+        VERSION: 3,
+        KEY_SIZES: { MAC: 32, IV: 16, PUBLIC_KEY: 33 },
+        BITS: { TUPLE_SHIFT: 4, TUPLE_MASK: 0xf, MAX_TUPLE_VALUE: 15 },
+        MESSAGE_KEYS: { DERIVE_INFO: 'WhisperMessageKeys' },
+        SESSION: { MAX_MESSAGE_KEYS: 2000 }
+    };
+    ValidationUtils = {
+        assertBuffer: (value) => {
+            if (!(value instanceof Buffer)) {
+                throw TypeError(`Expected Buffer instead of: ${value.constructor.name}`);
+            }
+            return value;
+        }
+    };
+    cryptoEngine = crypto;
+}
+
 function assertBuffer(value) {
     if (!(value instanceof Buffer)) {
         throw TypeError(`Expected Buffer instead of: ${value.constructor.name}`);
@@ -28,6 +54,22 @@ class SessionCipher {
         }
         this.addr = protocolAddress;
         this.storage = storage;
+        
+        // Internal optimizations - cache and context
+        this._cachedRecord = null;
+        this._lastRecordUpdate = 0;
+        this._encryptionContext = {
+            ourIdentityKey: null,
+            lastUsedCounter: -1
+        };
+        
+        // Performance metrics (optional)
+        this._metrics = {
+            encryptCount: 0,
+            decryptCount: 0,
+            cacheHits: 0,
+            cacheMisses: 0
+        };
     }
 
     _encodeTupleByte(number1, number2) {
@@ -45,27 +87,87 @@ class SessionCipher {
         return `<SessionCipher(${this.addr.toString()})>`;
     }
 
-    async getRecord() {
+    async getRecord(forceRefresh = false) {
+        const now = Date.now();
+        
+        // Use cache if recent and not forcing refresh
+        if (!forceRefresh && 
+            this._cachedRecord && 
+            (now - this._lastRecordUpdate) < 1000) {
+            this._metrics.cacheHits++;
+            return this._cachedRecord;
+        }
+        
+        this._metrics.cacheMisses++;
         const record = await this.storage.loadSession(this.addr.toString());
         if (record && !(record instanceof SessionRecord)) {
             throw new TypeError('SessionRecord type expected from loadSession'); 
         }
+        
+        // Update cache
+        this._cachedRecord = record;
+        this._lastRecordUpdate = now;
+        
         return record;
     }
 
     async storeRecord(record) {
         record.removeOldSessions();
         await this.storage.storeSession(this.addr.toString(), record);
+        
+        // Update cache
+        this._cachedRecord = record;
+        this._lastRecordUpdate = Date.now();
     }
 
     async queueJob(awaitable) {
         return await queueJob(this.addr.toString(), awaitable);
     }
+    
+    // Get or cache our identity key for performance
+    async getOurIdentityKey() {
+        if (!this._encryptionContext.ourIdentityKey) {
+            this._encryptionContext.ourIdentityKey = await this.storage.getOurIdentity();
+        }
+        return this._encryptionContext.ourIdentityKey;
+    }
+    
+    // Optimized fillMessageKeys with constants
+    fillMessageKeys(chain, counter) {
+        if (Object.keys(chain.messageKeys).length >= CONSTANTS.SESSION.MAX_MESSAGE_KEYS) {
+            throw new Error("Too many message keys for chain");
+        }
+        
+        if (chain.chainKey.counter >= counter) {
+            return;
+        }
+        
+        if (counter - chain.chainKey.counter > CONSTANTS.SESSION.MAX_MESSAGE_KEYS) {
+            throw new Error("Gap between counters too large");
+        }
+        
+        if (chain.chainKey.key) {
+            const key = chain.chainKey.key;
+            while (chain.chainKey.counter < counter) {
+                chain.messageKeys[chain.chainKey.counter + 1] = 
+                    cryptoEngine.deriveSecrets ? 
+                    cryptoEngine.deriveSecrets(key, Buffer.alloc(32), Buffer.from(CONSTANTS.MESSAGE_KEYS.DERIVE_INFO)) :
+                    crypto.deriveSecrets(key, Buffer.alloc(32), Buffer.from("WhisperMessageKeys"));
+                
+                chain.chainKey.key = cryptoEngine.calculateMAC ? 
+                    cryptoEngine.calculateMAC(key, Buffer.from([1])) :
+                    crypto.calculateMAC(key, Buffer.from([1]));
+                chain.chainKey.counter++;
+            }
+        }
+    }
 
     async encrypt(data) {
         assertBuffer(data);
-        const ourIdentityKey = await this.storage.getOurIdentity();
+        const ourIdentityKey = await this.getOurIdentityKey(); // Use cached version
         return await this.queueJob(async () => {
+            this._metrics.encryptCount++;
+            
             const record = await this.getRecord();
             if (!record) {
                 throw new errors.SessionError("No sessions");
@@ -83,26 +185,46 @@ class SessionCipher {
                 throw new Error("Tried to encrypt on a receiving chain");
             }
             this.fillMessageKeys(chain, chain.chainKey.counter + 1);
-            const keys = crypto.deriveSecrets(chain.messageKeys[chain.chainKey.counter],
-                                              Buffer.alloc(32), Buffer.from("WhisperMessageKeys"));
+            
+            // Use optimized crypto if available
+            const keys = cryptoEngine.deriveSecrets ?
+                cryptoEngine.deriveSecrets(chain.messageKeys[chain.chainKey.counter],
+                                          Buffer.alloc(32), Buffer.from(CONSTANTS.MESSAGE_KEYS.DERIVE_INFO)) :
+                crypto.deriveSecrets(chain.messageKeys[chain.chainKey.counter],
+                                    Buffer.alloc(32), Buffer.from("WhisperMessageKeys"));
+            
             delete chain.messageKeys[chain.chainKey.counter];
             const msg = protobufs.WhisperMessage.create();
             msg.ephemeralKey = session.currentRatchet.ephemeralKeyPair.pubKey;
             msg.counter = chain.chainKey.counter;
             msg.previousCounter = session.currentRatchet.previousCounter;
-            msg.ciphertext = crypto.encrypt(keys[0], data, keys[2].slice(0, 16));
+            
+            // Use optimized encryption if available
+            msg.ciphertext = cryptoEngine.encrypt ?
+                cryptoEngine.encrypt(keys[0], data, keys[2].slice(0, 16)) :
+                crypto.encrypt(keys[0], data, keys[2].slice(0, 16));
+                
             const msgBuf = protobufs.WhisperMessage.encode(msg).finish();
-            const macInput = Buffer.alloc(msgBuf.byteLength + (33 * 2) + 1);
+            const macInput = Buffer.alloc(msgBuf.byteLength + (CONSTANTS.KEY_SIZES.PUBLIC_KEY * 2) + 1);
             macInput.set(ourIdentityKey.pubKey);
-            macInput.set(session.indexInfo.remoteIdentityKey, 33);
-            macInput[33 * 2] = this._encodeTupleByte(VERSION, VERSION);
-            macInput.set(msgBuf, (33 * 2) + 1);
-            const mac = crypto.calculateMAC(keys[1], macInput);
+            macInput.set(session.indexInfo.remoteIdentityKey, CONSTANTS.KEY_SIZES.PUBLIC_KEY);
+            macInput[CONSTANTS.KEY_SIZES.PUBLIC_KEY * 2] = this._encodeTupleByte(VERSION, VERSION);
+            macInput.set(msgBuf, (CONSTANTS.KEY_SIZES.PUBLIC_KEY * 2) + 1);
+            
+            // Use optimized MAC calculation if available
+            const mac = cryptoEngine.calculateMAC ?
+                cryptoEngine.calculateMAC(keys[1], macInput) :
+                crypto.calculateMAC(keys[1], macInput);
+                
             const result = Buffer.alloc(msgBuf.byteLength + 9);
             result[0] = this._encodeTupleByte(VERSION, VERSION);
             result.set(msgBuf, 1);
             result.set(mac.slice(0, 8), msgBuf.byteLength + 1);
             await this.storeRecord(record);
+            
+            // Track last used counter for optimization
+            this._encryptionContext.lastUsedCounter = chain.chainKey.counter;
+            
             let type, body;
             if (session.pendingPreKey) {
                 type = 3;  // prekey bundle
@@ -155,8 +277,9 @@ class SessionCipher {
             }
         }
         
-        for (const e of errs) {
-           
+        // Log errors for debugging but don't spam console
+        if (errs.length > 0) {
+            console.warn(`Failed to decrypt with ${errs.length} sessions:`, errs[0].message);
         }
         throw new errors.SessionError("No matching sessions found for message");
     }
@@ -164,6 +287,8 @@ class SessionCipher {
     async decryptWhisperMessage(data) {
         assertBuffer(data);
         return await this.queueJob(async () => {
+            this._metrics.decryptCount++;
+            
             const record = await this.getRecord();
             if (!record) {
                 throw new errors.SessionError("No session record");
@@ -330,6 +455,47 @@ class SessionCipher {
                 }
             }
         });
+    }
+    
+    // New optimization methods
+    
+    /**
+     * Clear cached data for this session cipher
+     */
+    clearCache() {
+        this._cachedRecord = null;
+        this._lastRecordUpdate = 0;
+        this._encryptionContext.ourIdentityKey = null;
+        this._encryptionContext.lastUsedCounter = -1;
+    }
+    
+    /**
+     * Get performance metrics
+     * @returns {Object} Performance metrics
+     */
+    getMetrics() {
+        return { ...this._metrics };
+    }
+    
+    /**
+     * Reset performance metrics
+     */
+    resetMetrics() {
+        this._metrics = {
+            encryptCount: 0,
+            decryptCount: 0,
+            cacheHits: 0,
+            cacheMisses: 0
+        };
+    }
+    
+    /**
+     * Get cache efficiency ratio
+     * @returns {number} Cache hit ratio (0-1)
+     */
+    getCacheEfficiency() {
+        const total = this._metrics.cacheHits + this._metrics.cacheMisses;
+        return total === 0 ? 0 : this._metrics.cacheHits / total;
     }
 }
 
